@@ -221,3 +221,154 @@ class MLP(nn.Module):
 
 + 批归一化
 + 层归一化
+
+### 2.3 搭建一个Transformer
+
+#### 2.3.1 Embedding层
+
+ 在 NLP 任务中，我们往往需要将自然语言的输入转化为机器可以处理的向量。在深度学习中，承担这个任务的组件就是 Embedding 层。
+
+Embedding 层其实是一个存储固定大小的词典的嵌入向量查找表。
+
+****
+
+```
+input: 我
+output: 0
+
+input: 喜欢
+output: 1
+
+input：你
+output: 2
+```
+
+因此，Embedding 层的输入往往是一个形状为 （batch_size，seq_len，1）的矩阵，第一个维度是一次批处理的数量，第二个维度是自然语言序列的长度，第三个维度则是 token 经过 tokenizer 转化成的 index 值。例如，对上述输入，Embedding 层的输入会是：
+
+```
+[[[0],[1],[2]]]
+```
+
+其 batch_size 为1，seq_len 为3，转化出来的 index 如上。
+
+#### 2.3.2 位置编码
+
+注意力机制可以实现良好的并行计算，但同时，其注意力计算的方式也导致序列中相对位置的丢失。在 RNN、LSTM 中，输入序列会沿着语句本身的顺序被依次递归处理，因此输入序列的顺序提供了极其重要的信息，这也和自然语言的本身特性非常吻合。
+
+```python
+class PositionalEncoding(nn.Module):
+    '''位置编码模块'''
+
+    def __init__(self, args):
+        super(PositionalEncoding, self).__init__()
+        # Dropout 层
+        # self.dropout = nn.Dropout(p=args.dropout)
+
+        # block size 是序列的最大长度
+        pe = torch.zeros(args.block_size, args.n_embd)
+        position = torch.arange(0, args.block_size).unsqueeze(1)
+        # 计算 theta
+        div_term = torch.exp(
+            torch.arange(0, args.n_embd, 2) * -(math.log(10000.0) / args.n_embd)
+        )
+        # 分别计算 sin、cos 结果
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x):
+        # 将位置编码加到 Embedding 结果上
+        x = x + self.pe[:, : x.size(1)].requires_grad_(False)
+        return x
+```
+
+#### 2.3.3 一个完整的Transformer
+
+![image-20260420221537552](C:/Users/user/AppData/Roaming/Typora/typora-user-images/image-20260420221537552.png)
+
+基于之前所实现过的组件，我们实现完整的 Transformer 模型：
+
+```python
+class Transformer(nn.Module):
+   '''整体模型'''
+    def __init__(self, args):
+        super().__init__()
+        # 必须输入词表大小和 block size
+        assert args.vocab_size is not None
+        assert args.block_size is not None
+        self.args = args
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(args.vocab_size, args.n_embd),
+            wpe = PositionalEncoding(args),
+            drop = nn.Dropout(args.dropout),
+            encoder = Encoder(args),
+            decoder = Decoder(args),
+        ))
+        # 最后的线性层，输入是 n_embd，输出是词表大小
+        self.lm_head = nn.Linear(args.n_embd, args.vocab_size, bias=False)
+
+        # 初始化所有的权重
+        self.apply(self._init_weights)
+
+        # 查看所有参数的数量
+        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+    '''统计所有参数的数量'''
+    def get_num_params(self, non_embedding=False):
+        # non_embedding: 是否统计 embedding 的参数
+        n_params = sum(p.numel() for p in self.parameters())
+        # 如果不统计 embedding 的参数，就减去
+        if non_embedding:
+            n_params -= self.transformer.wte.weight.numel()
+        return n_params
+
+    '''初始化权重'''
+    def _init_weights(self, module):
+        # 线性层和 Embedding 层初始化为正则分布
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    '''前向计算函数'''
+    def forward(self, idx, targets=None):
+        # 输入为 idx，维度为 (batch size, sequence length, 1)；targets 为目标序列，用于计算 loss
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.args.block_size, f"不能计算该序列，该序列长度为 {t}, 最大序列长度只有 {self.args.block_size}"
+
+        # 通过 self.transformer
+        # 首先将输入 idx 通过 Embedding 层，得到维度为 (batch size, sequence length, n_embd)
+        print("idx",idx.size())
+        # 通过 Embedding 层
+        tok_emb = self.transformer.wte(idx)
+        print("tok_emb",tok_emb.size())
+        # 然后通过位置编码
+        pos_emb = self.transformer.wpe(tok_emb) 
+        # 再进行 Dropout
+        x = self.transformer.drop(pos_emb)
+        # 然后通过 Encoder
+        print("x after wpe:",x.size())
+        enc_out = self.transformer.encoder(x)
+        print("enc_out:",enc_out.size())
+        # 再通过 Decoder
+        x = self.transformer.decoder(x, enc_out)
+        print("x after decoder:",x.size())
+
+        if targets is not None:
+            # 训练阶段，如果我们给了 targets，就计算 loss
+            # 先通过最后的 Linear 层，得到维度为 (batch size, sequence length, vocab size)
+            logits = self.lm_head(x)
+            # 再跟 targets 计算交叉熵
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # 推理阶段，我们只需要 logits，loss 为 None
+            # 取 -1 是只取序列中的最后一个作为输出
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            loss = None
+
+        return logits, loss
+```
